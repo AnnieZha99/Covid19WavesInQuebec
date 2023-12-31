@@ -1,0 +1,301 @@
+---
+output:
+  pdf_document: default
+---
+ ---
+title: "Age-Stratified Impact: Assessing COVID-19 Waves in Quebec"
+author: "Yingfei Zha"
+date: "15/11/2020"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(tidy=TRUE, echo=FALSE, warning = FALSE, message = FALSE)
+
+```
+
+```{r data, include=FALSE, tidy=TRUE, tidy.opts=list(width.cutoff=30)}
+xWide = read.table(paste0("https://www.stat.gouv.qc.ca/statistiques/", 
+                          "population-demographie/deces-mortalite/",
+                          "WeeklyDeaths_QC_2010-2020_AgeGr.csv"), sep = ";", 
+                   skip = 7, col.names = c("year", "junk", "age", paste0("w", 1:53)))
+xWide = xWide[grep("^[[:digit:]]+$", xWide$year), ] 
+x = reshape2::melt(xWide, id.vars = c("year", "age"), measure.vars = grep("^w[[:digit:]]+$", 
+                                                                          colnames(xWide))) 
+x$dead = as.numeric(gsub("[[:space:]]", "", x$value)) 
+x$week = as.numeric(gsub("w", "", x$variable))
+x$year = as.numeric(x$year)
+x = x[order(x$year, x$week, x$age), ]
+
+newYearsDay = as.Date(ISOdate(x$year, 1, 1)) 
+x$time = newYearsDay + 7 * (x$week - 1)
+x = x[!is.na(x$dead), ]
+x = x[x$week < 53, ]
+```
+
+```{r time}
+#Divide the data into pre and post covid, add extra dates to data so that INLA will create forecasts.
+dateCutoff = as.Date("2020/3/1")
+xPreCovid = x[x$time < dateCutoff, ]
+xPostCovid = x[x$time >= dateCutoff, ]
+toForecast = expand.grid(age = unique(x$age), time = unique(xPostCovid$time), dead = NA)
+xForInla = rbind(xPreCovid[, colnames(toForecast)], toForecast)
+xForInla = xForInla[order(xForInla$time, xForInla$age),]
+#Create some time variables, including sines and cosines. 
+#Time in years and centred is numerically stable in INLA.
+xForInla$timeNumeric = as.numeric(xForInla$time)
+xForInla$timeForInla = (xForInla$timeNumeric - as.numeric(as.Date("2015/1/1")))/365.25 
+xForInla$timeIid = xForInla$timeNumeric
+xForInla$sin12 = sin(2 * pi * xForInla$timeNumeric/365.25)
+xForInla$sin6 = sin(2 * pi * xForInla$timeNumeric * 2/365.25)
+xForInla$cos12 = cos(2 * pi * xForInla$timeNumeric/365.25) 
+xForInla$cos6 = cos(2 * pi * xForInla$timeNumeric * 2/365.25)
+```
+
+
+```{r, include=FALSE}
+plot(x[x$age == "0-49 years old", c("time", "dead")], type = "o",
+log = "y")
+```
+```{r, include=FALSE}
+xWide2 = reshape2::dcast(x, week + age ~ year, value.var = "dead")
+Syear = grep("[[:digit:]]", colnames(xWide2), value = TRUE)
+Scol = RColorBrewer::brewer.pal(length(Syear), "Spectral")
+matplot(xWide2[xWide2$age == "0-49 years old", Syear], type = "l",
+lty = 1, col = Scol, xlab="week")
+legend("topright", col = Scol, legend = Syear, bty = "n",
+lty = 1, lwd = 3)
+```
+
+```{r model under 50}
+xForInlaYoung= xForInla[xForInla$age == '0-49 years old', ]
+library(INLA, verbose=FALSE)
+mod.young = inla(dead ~ sin12 + sin6 + cos12 + cos6 +
+f(timeIid, prior='pc.prec', param= c(log(1.2), 0.5)) +
+f(timeForInla, model = 'rw2', prior='pc.prec', param= c(0.01, 0.5)),
+data=xForInlaYoung,
+control.predictor = list(compute=TRUE, link=1),
+control.compute = list(config=TRUE),
+# control.inla = list(fast=FALSE, strategy='laplace'),
+family='poisson')
+```
+
+```{r table young}
+qCols = paste0(c(0.5, 0.025, 0.975), "quant")
+knitr::kable(rbind(exp(mod.young$summary.fixed[, qCols]), 
+                   exp(Pmisc::priorPost(mod.young)$summary[,
+qCols])), 
+digits = 3, 
+caption="Estimated rate ratio and exponentiated SD in the model of the people under 50 yrs old")
+```
+
+```{r young sample}
+set.seed(1)
+sampleList.young = INLA::inla.posterior.sample(30, mod.young, selection = list(Predictor = 0))
+sampleIntensity.young = exp(do.call(cbind, Biobase::subListExtract(sampleList.young,
+"latent")))
+sampleDeaths.young = matrix(rpois(length(sampleIntensity.young),
+sampleIntensity.young), nrow(sampleIntensity.young), ncol(sampleIntensity.young))
+```
+
+```{r}
+xPostCovidYoung = xPostCovid[xPostCovid$age == "0-49 years old",
+]
+xPostCovidForecastYoung = sampleDeaths.young[match(xPostCovidYoung$time,
+xForInlaYoung$time), ]
+excessDeathsYoung = xPostCovidYoung$dead - xPostCovidForecastYoung
+```
+
+```{r, include=FALSE}
+plot(x[x$age == "70 years old and over", c("time", "dead")], type = "o",
+log = "y")
+```
+```{r, include=FALSE}
+xWide2 = reshape2::dcast(x, week + age ~ year, value.var = "dead")
+Syear = grep("[[:digit:]]", colnames(xWide2), value = TRUE)
+Scol = RColorBrewer::brewer.pal(length(Syear), "Spectral")
+matplot(xWide2[xWide2$age == "70 years old and over", Syear], type = "l",
+lty = 1, col = Scol, xlab="week")
+legend("topright", col = Scol, legend = Syear, bty = "n",
+lty = 1, lwd = 3,cex = 0.5)
+```
+
+```{r model over 70}
+xForInlaOld= xForInla[xForInla$age == "70 years old and over", ]
+library(INLA, verbose=FALSE)
+mod.old = inla(dead ~ sin12 + sin6 + cos12 + cos6 +
+f(timeIid, prior='pc.prec', param= c(log(1.2), 0.5)) +
+f(timeForInla, model = 'rw2', prior='pc.prec', param= c(0.01, 0.5)),
+data=xForInlaOld,
+control.predictor = list(compute=TRUE, link=1),
+control.compute = list(config=TRUE),
+# control.inla = list(fast=FALSE, strategy='laplace'),
+family='poisson')
+```
+
+```{r table old}
+qCols = paste0(c(0.5, 0.025, 0.975), "quant")
+knitr::kable(rbind(exp(mod.old$summary.fixed[, qCols]), 
+                   exp(Pmisc::priorPost(mod.old)$summary[,
+qCols])), digits = 3, 
+caption="Estimated rate ratio and exponentiated SD in the model of the people over 70 yrs old")
+```
+
+```{r old sample}
+sampleList.old = INLA::inla.posterior.sample(30, mod.old, selection = list(Predictor = 0))
+
+sampleIntensity.old = exp(do.call(cbind, Biobase::subListExtract(sampleList.old,
+"latent")))
+sampleDeaths.old = matrix(rpois(length(sampleIntensity.old),
+sampleIntensity.old), nrow(sampleIntensity.old), ncol(sampleIntensity.old))
+```
+
+```{r calculate excess death}
+xPostCovidOld = xPostCovid[xPostCovid$age == "70 years old and over",
+]
+xPostCovidForecastOld = sampleDeaths.old[match(xPostCovidOld$time,
+xForInlaOld$time), ]
+excessDeathsOld = xPostCovidOld$dead - xPostCovidForecastOld
+```
+
+```{r plots young, fig.cap="Plots of seasonally adjusted trend and posterior quantiles of 30 posterior samples with the observed deaths of young people."}
+
+par(mfrow=c(2,1))
+par(mai = c(0.5, 1, 0.2, 1))
+#time trend of the young all the time
+matplot(xForInlaYoung$time,exp(mod.young$summary.random$timeForInla[, c("0.5quant", "0.975quant",
+"0.025quant")]), type = "l", lty = c(1, 2, 2), col = "black", xlab='time', ylab='relative risk', 
+main="Plot 1: Posterior quantiles of random effect")
+legend("bottomleft", col=c("black","black"),bty="n", legend=c("mean", "quantiles"), 
+       lty=c(1,2),cex = 0.8)
+
+#Young samples real post covid
+library(GET)
+cset.y = GET::create_curve_set(list(r=as.numeric(xForInlaYoung$time), obs=sampleDeaths.young))
+myEnv.y = GET::central_region(cset.y, coverage=0.95)
+matplot(xForInlaYoung$time, as.data.frame(myEnv.y)[,c("lo","hi","central")], type = "l", 
+        lty = c(2, 2, 1), col = "black", xlab='time', ylab='number of deaths',
+        xlim = as.Date(c("2019/6/1",
+"2020/11/1")), main="Plot 2: Posterior quantiles of samples and actual deaths")
+points(x[x$age == "0-49 years old", c("time", "dead")], col = "red",
+cex = 0.5)
+legend("topleft", col=c("black","black","red"), bty="n", 
+       legend=c("sample mean", "95% envelop","Observed deaths"), lty=c(1,2,NA), pch=c(NA, NA, 1),
+       cex = 0.7)
+
+```
+
+```{r Young excess deaths plot, fig.cap="Plots of posterior quantiles of samples with the observed deaths and excess deaths of young people since March 2020."}
+par(mfrow=c(2,1))
+par(mai = c(0.5, 1, 0.2, 1))
+#Young sample forecast vs real post covid
+cset2.y = GET::create_curve_set(list(r=as.numeric(xPostCovidYoung$time), obs=xPostCovidForecastYoung))
+myEnv2.y = GET::central_region(cset2.y, coverage=0.95)
+matplot(xPostCovidYoung$time, as.data.frame(myEnv2.y)[,c("lo","hi","central")], type = "l", 
+        lty = c(2, 2, 1), col = "black", xlab='time', ylab='number of death',ylim=c(20, 90),
+        main="Plot 1: Forecasted deaths and actual deaths")
+points(xPostCovidYoung[, c("time", "dead")], col = "red")
+legend("topright", col=c("black","black","red"), bty="n", legend=c("mean of posterior samples", "95% envelop of posterior samples","Observed deaths"), lty=c(1,2,NA), pch=c(NA, NA, 1),cex = 0.5)
+
+#Young excess deaths post covid
+cset3.y = GET::create_curve_set(list(r=as.numeric(xPostCovidYoung$time), obs=excessDeathsYoung))
+myEnv3.y = GET::central_region(cset3.y, coverage=0.95)
+matplot(xPostCovidYoung$time, excessDeathsYoung, type = "l", lty = 1, col = "#FF000020", xlab='time',
+        ylab='number of deaths', main="Plot 2: Excess deaths post COVID-19" )
+matlines(xPostCovidYoung$time, as.data.frame(myEnv3.y)[,c("lo","hi","central")], type = "l", 
+         lty = c(2, 2, 1), col = "black", xlab='time', ylab='number of death')
+legend("topright", col=c("black","black", "#FF000020"), bty="n", 
+       legend=c("mean of excess deaths", "95% envelop of excess deaths", "samples"), lty=c(1,2,1), 
+       cex = 0.7)
+```
+
+```{r young quantiles}
+#Total excess deaths march-may inclusive
+excessDeathsSubYoung = excessDeathsYoung[xPostCovidYoung$time >
+as.Date("2020/03/01") & xPostCovidYoung$time <
+as.Date("2020/06/01"), ]
+excessDeathsInPeriodYoung = apply(excessDeathsSubYoung, 2, sum)
+knitr::kable(round(quantile(excessDeathsInPeriodYoung)), col.names="Number of excess deaths", 
+             caption = "Quantiles of total excess deaths from the 30 posterior samples of people 
+             under 50 yrs old from March to May")
+#Excess deaths in most recent week
+knitr::kable(round(quantile(excessDeathsYoung[nrow(excessDeathsYoung), ])),
+             col.names="Number of excess deaths", caption = "Quantiles of total excess deaths from 
+             the 30 posterior samples of people under 50 yrs old in the most recent week")
+```
+
+```{r old quantiles}
+#Total excess deaths march-may inclusive
+excessDeathsSubOld = excessDeathsOld[xPostCovidOld$time >
+as.Date("2020/03/01") & xPostCovidOld$time <
+as.Date("2020/06/01"), ]
+excessDeathsInPeriodOld = apply(excessDeathsSubOld, 2, sum)
+knitr::kable(round(quantile(excessDeathsInPeriodOld)), col.names="Number of excess deaths", 
+             caption = "Quantiles of total excess deaths from the 30 posterior samples of people 
+             over 70 yrs old from March to May")
+#Excess deaths in most recent week
+knitr::kable(round(quantile(excessDeathsOld[nrow(excessDeathsOld), ])), 
+             col.names="Number of excess deaths", caption = "Quantiles of total excess deaths from 
+             the 30 posterior samples of people over 70 yrs old in the most recent week")
+```
+
+```{r plots, fig.cap="Plots of seasonally adjusted trend and posterior quantiles of 30 posterior samples with the observed deaths of the elderly."}
+par(mfrow=c(2,1))
+par(mai = c(0.5, 1, 0.2, 1))
+#time trend of the elder all the time
+matplot(xForInlaOld$time,exp(mod.old$summary.random$timeForInla[, c("0.5quant", "0.975quant", 
+"0.025quant")]), type = "l", lty = c(1, 2, 2), col = "black", xlab='time', ylab='relative risk',
+main="Plot 1: Seasonal adjusted trend")
+legend("topleft", col=c("black","black"),bty="n", legend=c("mean", "quantiles"), lty=c(1,2),cex = 0.8)
+#Elders samples real post covid
+
+library(GET)
+cset = GET::create_curve_set(list(r=as.numeric(xForInlaOld$time), obs=sampleDeaths.old))
+myEnv = GET::central_region(cset, coverage=0.95)
+matplot(xForInlaOld$time, as.data.frame(myEnv)[,c("lo","hi","central")], type = "l", lty = c(2, 2, 1),
+        col = "black", xlab='time', ylab='number of deaths', 
+        xlim = as.Date(c("2019/6/1", "2020/11/1")),
+        ylim=c(600, 1800), 
+        main="Plot 2: Posterior samples and actual deaths")
+points(x[x$age == "70 years old and over", c("time", "dead")], col = "red", cex = 0.5)
+legend("topleft", col=c("black","black","red"), bty="n", 
+       legend=c("sample mean", "95% envelop","Observed deaths"), lty=c(1,2,NA), pch=c(NA, NA, 1),
+       cex = 0.7)
+```
+
+```{r old excess deaths plot, fig.cap="Plots of posterior quantiles of the samples with the observed deaths and excess deaths of the elderly since March 2020."}
+par(mfrow=c(2,1))
+par(mai = c(0.5, 1, 0.2, 1))
+#Elders sample forecast vs real post covid
+cset2 = GET::create_curve_set(list(r=as.numeric(xPostCovidOld$time), obs=xPostCovidForecastOld))
+myEnv2 = GET::central_region(cset2, coverage=0.95)
+matplot(xPostCovidOld$time, as.data.frame(myEnv2)[,c("lo","hi","central")], type = "l", 
+        lty = c(2, 2, 1), col = "black", xlab='time', ylab='number of death',ylim=c(600, 1800), 
+        main="Plot 1: Forecasted deaths and actual deaths")
+points(xPostCovidOld[, c("time", "dead")], col = "red")
+legend("topright", col=c("black","black","red"), bty="n", 
+       legend=c("mean of posterior samples", "95% envelop of posterior samples","Observed deaths"),
+       lty=c(1,2,NA), pch=c(NA, NA, 1),cex = 0.7)
+
+#Elders excess deaths post covid
+cset3 = GET::create_curve_set(list(r=as.numeric(xPostCovidOld$time), obs=excessDeathsOld))
+myEnv3 = GET::central_region(cset3, coverage=0.95)
+matplot(xPostCovidOld$time, excessDeathsOld, type = "l", lty = 1, col = "#FF000020", xlab='time',
+        ylab='number of deaths', main="Plot 2: Excess deaths post COVID-19" )
+matlines(xPostCovidOld$time, as.data.frame(myEnv3)[,c("lo","hi","central")], type = "l", 
+         lty = c(2, 2, 1), col = "black", xlab='time', ylab='number of death')
+legend("topright", col=c("black","black", "#FF000020"), bty="n", 
+       legend=c("mean of excess deaths", "95% envelop of excess deaths", "samples"), lty=c(1,2,1), 
+       cex = 0.7)
+```
+
+
+
+\newpage
+# Appendix
+```{r all-code, ref.label=knitr::all_labels(), echo = TRUE, eval = FALSE}
+
+```
+
+
+
